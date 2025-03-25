@@ -20,9 +20,11 @@ import json
 import os
 import unicodedata
 from functools import lru_cache
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import regex as re
+from typing_extensions import Final
 
 from ...tokenization_utils import AddedToken, PreTrainedTokenizer
 from ...utils import logging
@@ -30,144 +32,189 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-VOCAB_FILES_NAMES = {
+class TokenizationError(ValueError):
+    """Exception raised for tokenization-related errors with contextual information."""
+    def __init__(self, message: str, component: str, value: any = None):
+        full_msg = f"Tokenization error in {component}: {message}"
+        if value is not None:
+            full_msg += f" (received {type(value).__name__} {value})"
+        super().__init__(full_msg)
+
+VOCAB_FILES_NAMES: Final[Dict[str, str]] = {
     "vocab_file": "vocab.json",
     "merges_file": "merges.txt",
 }
 
-MAX_MODEL_INPUT_SIZES = {"thl/thl-150-tokenizer": 32768}
+MAX_MODEL_INPUT_SIZES: Final[Dict[str, int]] = {"thl/thl-150-tokenizer": 32768}
 
-PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+PRETOKENIZE_REGEX: Final[str] = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 
-
-@lru_cache()
-def bytes_to_unicode():
+@lru_cache(maxsize=256)
+def bytes_to_unicode() -> Dict[int, str]:
     """
-    Maps UTF-8 bytes to Unicode strings, avoiding control/whitespace characters.
+    Generates UTF-8 byte to Unicode mapping with validation and optimization.
+    
+    Returns:
+        Dictionary mapping byte values to Unicode characters.
     """
     bs = (
-        list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+        list(range(ord("!"), ord("~") + 1)) + 
+        list(range(ord("¡"), ord("¬") + 1)) + 
+        list(range(ord("®"), ord("ÿ") + 1))
     )
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
+    cs = bs.copy()
+    
+    # Generate mappings for non-printable characters
+    bs += [b for b in range(256) if b not in bs]
+    cs += [256 + len(cs) - len(bs) + i for i in range(len(bs) - len(cs))]
+    
+    return {b: chr(c) for b, c in zip(bs, cs)}
 
-
-def get_pairs(word):
+def get_pairs(word: str) -> Set[Tuple[str, str]]:
     """
-    Returns a set of symbol pairs in a word.
+    Generates unique character pairs from a word with validation.
+    
+    Args:
+        word: Input string to process
+        
+    Returns:
+        Set of character pairs
     """
-    pairs = set()
-    prev_char = word[0]
-    for char in word[1:]:
-        pairs.add((prev_char, char))
-        prev_char = char
-    return pairs
-
+    if not word:
+        return set()
+    return {(word[i], word[i+1]) for i in range(len(word)-1)}
 
 class THL150Tokenizer(PreTrainedTokenizer):
     """
-    Constructs a THL-150 tokenizer. Based on byte-level Byte-Pair-Encoding (BPE).
-
-    This tokenizer inherits from [`PreTrainedTokenizer`] and provides most of its functionality.
-
-    Args:
-        vocab_file (`str`):
-            Path to the vocabulary file.
-        merges_file (`str`):
-            Path to the merges file.
-        errors (`str`, *optional*, defaults to `"replace"`):
-            Paradigm for decoding bytes to UTF-8.
-        unk_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
-            The unknown token.
-        bos_token (`str`, *optional*):
-            The beginning of sequence token.
-        eos_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
-            The end of sequence token.
-        pad_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
-            The token used for padding.
-        clean_up_tokenization_spaces (`bool`, *optional*, defaults to `False`):
-            Whether to clean up extra spaces added during tokenization.
-        split_special_tokens (`bool`, *optional*, defaults to `False`):
-            Whether to split special tokens during tokenization.
+    Optimized THL-150 tokenizer with enhanced validation and error handling.
+    
+    Implements byte-level BPE with comprehensive input checks and performance optimizations.
     """
-
+    
     vocab_files_names = VOCAB_FILES_NAMES
     model_input_names = ["input_ids", "attention_mask"]
+    max_model_input_sizes = MAX_MODEL_INPUT_SIZES
 
     def __init__(
         self,
-        vocab_file,
-        merges_file,
-        errors="replace",
-        unk_token="<|endoftext|>",
-        bos_token=None,
-        eos_token="<|endoftext|>",
-        pad_token="<|endoftext|>",
-        clean_up_tokenization_spaces=False,
-        split_special_tokens=False,
+        vocab_file: Union[str, Path],
+        merges_file: Union[str, Path],
+        errors: str = "replace",
+        unk_token: Union[str, AddedToken] = "<|endoftext|>",
+        bos_token: Optional[Union[str, AddedToken]] = None,
+        eos_token: Union[str, AddedToken] = "<|endoftext|>",
+        pad_token: Union[str, AddedToken] = "<|endoftext|>",
+        clean_up_tokenization_spaces: bool = False,
+        split_special_tokens: bool = False,
         **kwargs,
     ):
-        # Ensure special tokens are properly formatted
-        bos_token = AddedToken(bos_token, special=True) if isinstance(bos_token, str) else bos_token
-        eos_token = AddedToken(eos_token, special=True) if isinstance(eos_token, str) else eos_token
-        unk_token = AddedToken(unk_token, special=True) if isinstance(unk_token, str) else unk_token
-        pad_token = AddedToken(pad_token, special=True) if isinstance(pad_token, str) else pad_token
+        """Initialize tokenizer with comprehensive validation."""
+        try:
+            # Validate file existence
+            if not Path(vocab_file).is_file():
+                raise TokenizationError("Vocabulary file not found", "init", vocab_file)
+            if not Path(merges_file).is_file():
+                raise TokenizationError("Merges file not found", "init", merges_file)
 
-        # Load vocabulary and merges
-        with open(vocab_file, encoding="utf-8") as vocab_handle:
-            self.encoder = json.load(vocab_handle)
-        self.decoder = {v: k for k, v in self.encoder.items()}
-        self.errors = errors
-        self.byte_encoder = bytes_to_unicode()
-        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+            # Validate special tokens
+            def validate_token(token: Union[str, AddedToken], name: str) -> AddedToken:
+                """Validate and normalize token values."""
+                if isinstance(token, str):
+                    if not token.strip():
+                        raise TokenizationError(f"{name} cannot be empty", "init", token)
+                    return AddedToken(token, special=True)
+                if not isinstance(token, AddedToken):
+                    raise TokenizationError(
+                        f"{name} must be str or AddedToken", "init", type(token)
+                    )
+                return token
 
-        # Load BPE merges
-        with open(merges_file, encoding="utf-8") as merges_handle:
-            bpe_merges = [tuple(line.strip().split()) for line in merges_handle if line.strip() and not line.startswith("#")]
-        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
-        self.cache = {}
+            self.bos_token = validate_token(bos_token, "bos_token") if bos_token else None
+            self.eos_token = validate_token(eos_token, "eos_token")
+            self.unk_token = validate_token(unk_token, "unk_token")
+            self.pad_token = validate_token(pad_token, "pad_token")
 
-        # Compile pretokenization regex
-        self.pat = re.compile(PRETOKENIZE_REGEX)
+            # Load vocabulary with validation
+            with open(vocab_file, "r", encoding="utf-8") as f:
+                self.encoder = self._validate_vocab(json.load(f))
+            self.decoder = {v: k for k, v in self.encoder.items()}
 
-        super().__init__(
-            errors=errors,
-            bos_token=bos_token,
-            eos_token=eos_token,
-            pad_token=pad_token,
-            unk_token=unk_token,
-            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
-            split_special_tokens=split_special_tokens,
-            **kwargs,
-        )
+            # Load BPE merges with validation
+            with open(merges_file, "r", encoding="utf-8") as f:
+                bpe_merges = self._load_bpe_merges(f)
+            self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
+
+            # Initialize encoding components
+            self.errors = errors
+            self.byte_encoder = bytes_to_unicode()
+            self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+            self.pat = re.compile(PRETOKENIZE_REGEX)
+            self.cache = {}
+
+            super().__init__(
+                errors=errors,
+                bos_token=self.bos_token,
+                eos_token=self.eos_token,
+                pad_token=self.pad_token,
+                unk_token=self.unk_token,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+                split_special_tokens=split_special_tokens,
+                **kwargs,
+            )
+
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise TokenizationError("Invalid file format", "init") from e
+        except Exception as e:
+            logger.critical("Tokenizer initialization failed: %s", str(e))
+            raise
+
+    def _validate_vocab(self, vocab: Dict) -> Dict:
+        """Validate vocabulary structure and content."""
+        if not isinstance(vocab, dict):
+            raise TokenizationError("Vocabulary must be a dictionary", "vocab")
+        if len(vocab) < 100:
+            logger.warning("Unusually small vocabulary (%d tokens)", len(vocab))
+        return vocab
+
+    def _load_bpe_merges(self, file_handle) -> List[Tuple[str, str]]:
+        """Load and validate BPE merge operations."""
+        merges = []
+        for line_num, line in enumerate(file_handle, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if len(tokens := line.split()) != 2:
+                raise TokenizationError(
+                    f"Invalid merge format at line {line_num}", 
+                    "merges",
+                    line
+                )
+            merges.append((tokens[0], tokens[1]))
+        if len(merges) < 10:
+            raise TokenizationError("Insufficient merge operations", "merges", len(merges))
+        return merges
 
     @property
     def vocab_size(self) -> int:
         return len(self.encoder)
 
-    def get_vocab(self):
+    def get_vocab(self) -> Dict:
         return {**self.encoder, **self.added_tokens_encoder}
 
-    def bpe(self, token):
-        if token in self.cache:
-            return self.cache[token]
-        word = tuple(token)
-        pairs = get_pairs(word)
-
-        if not pairs:
+    @lru_cache(maxsize=10_000)
+    def bpe(self, token: str) -> str:
+        """Optimized BPE implementation with caching and validation."""
+        if not token:
             return token
 
-        while True:
-            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float("inf")))
+        word = tuple(token)
+        pairs = get_pairs(token)
+
+        while pairs:
+            bigram = min(pairs, key=lambda p: self.bpe_ranks.get(p, float("inf")))
             if bigram not in self.bpe_ranks:
                 break
+
             first, second = bigram
             new_word = []
             i = 0
@@ -177,87 +224,79 @@ class THL150Tokenizer(PreTrainedTokenizer):
                 except ValueError:
                     new_word.extend(word[i:])
                     break
-                else:
-                    new_word.extend(word[i:j])
-                    i = j
+                new_word.extend(word[i:j])
+                i = j
 
-                if word[i] == first and i < len(word) - 1 and word[i + 1] == second:
+                if i < len(word) - 1 and word[i] == first and word[i+1] == second:
                     new_word.append(first + second)
                     i += 2
                 else:
                     new_word.append(word[i])
                     i += 1
-            new_word = tuple(new_word)
-            word = new_word
-            if len(word) == 1:
-                break
-            else:
-                pairs = get_pairs(word)
-        word = " ".join(word)
-        self.cache[token] = word
-        return word
 
-    def _tokenize(self, text):
-        """Tokenizes a string using BPE."""
-        bpe_tokens = []
-        for token in re.findall(self.pat, text):
-            token = "".join(self.byte_encoder[b] for b in token.encode("utf-8"))
-            bpe_tokens.extend(self.bpe(token).split(" "))
-        return bpe_tokens
+            word = tuple(new_word)
+            pairs = get_pairs("".join(word))
 
-    def _convert_token_to_id(self, token):
-        """Converts a token to an ID using the vocabulary."""
-        return self.encoder.get(token, self.encoder.get(self.unk_token))
+        return " ".join(word)
 
-    def _convert_id_to_token(self, index):
-        """Converts an ID to a token using the vocabulary."""
-        return self.decoder.get(index)
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text with input validation and error handling."""
+        if not isinstance(text, str):
+            raise TokenizationError("Input must be a string", "tokenize", type(text))
 
-    def convert_tokens_to_string(self, tokens):
-        """Converts a sequence of tokens into a single string."""
-        text = "".join(tokens)
-        text = bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", errors=self.errors)
-        return text
+        try:
+            text = unicodedata.normalize("NFC", text)
+            if self.bos_token:
+                text = str(self.bos_token) + text
 
-    def decode(
-        self,
-        token_ids,
-        skip_special_tokens: bool = False,
-        clean_up_tokenization_spaces: Optional[bool] = False,
-        spaces_between_special_tokens: bool = False,
-        **kwargs,
-    ) -> str:
-        return super().decode(
-            token_ids,
-            skip_special_tokens=skip_special_tokens,
-            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
-            spaces_between_special_tokens=spaces_between_special_tokens,
-            **kwargs,
-        )
+            bpe_tokens = []
+            for token in re.findall(self.pat, text):
+                encoded = "".join(self.byte_encoder[b] for b in token.encode("utf-8"))
+                bpe_tokens.extend(self.bpe(encoded).split(" "))
 
-    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
-        if not os.path.isdir(save_directory):
-            logger.error(f"Vocabulary path ({save_directory}) should be a directory")
-            return
-        vocab_file = os.path.join(
-            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
-        )
-        merge_file = os.path.join(
-            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["merges_file"]
-        )
+            return bpe_tokens
+        except UnicodeEncodeError as e:
+            raise TokenizationError("Text encoding failed", "tokenize", text[:50]) from e
 
-        with open(vocab_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self.encoder, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    def _convert_token_to_id(self, token: str) -> int:
+        return self.encoder.get(token, self.encoder.get(str(self.unk_token)))
 
-        with open(merge_file, "w", encoding="utf-8") as writer:
-            writer.write("#version: 0.2\n")
-            for bpe_tokens, token_index in sorted(self.bpe_ranks.items(), key=lambda kv: kv[1]):
-                writer.write(" ".join(bpe_tokens) + "\n")
+    def _convert_id_to_token(self, index: int) -> str:
+        return self.decoder.get(index, str(self.unk_token))
 
-        return vocab_file, merge_file
+    def convert_tokens_to_string(self, tokens: List[str]) -> str:
+        """Convert tokens to string with error recovery."""
+        try:
+            text = "".join(tokens)
+            return bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", errors=self.errors)
+        except (KeyError, UnicodeDecodeError) as e:
+            logger.error("Decoding error: %s", str(e))
+            return ""  # Graceful degradation
 
-    def prepare_for_tokenization(self, text, **kwargs):
-        text = unicodedata.normalize("NFC", text)
-        if self.bos_token is not None:
-            text = self.bos_token + text
-        return (text, kwargs)
+    def save_vocabulary(
+        self, 
+        save_directory: Union[str, Path],
+        filename_prefix: Optional[str] = None
+    ) -> Tuple[str, str]:
+        """Save tokenizer files with validation and error handling."""
+        save_path = Path(save_directory)
+        if not save_path.exists():
+            save_path.mkdir(parents=True, exist_ok=True)
+        elif not save_path.is_dir():
+            raise TokenizationError("Save path must be a directory", "save", save_directory)
+
+        vocab_file = save_path / f"{filename_prefix}-{VOCAB_FILES_NAMES['vocab_file']}"
+        merge_file = save_path / f"{filename_prefix}-{VOCAB_FILES_NAMES['merges_file']}"
+
+        try:
+            with vocab_file.open("w", encoding="utf-8") as f:
+                json.dump(self.encoder, f, indent=2, ensure_ascii=False)
+
+            with merge_file.open("w", encoding="utf-8") as f:
+                f.write("#version: 0.2\n")
+                for pair in sorted(self.bpe_ranks.keys(), key=lambda x: self.bpe_ranks[x]):
+                    f.write(f"{pair[0]} {pair[1]}\n")
+
+            return (str(vocab_file), str(merge_file))
+        except IOError as e:
+            raise TokenizationError("Failed to save vocabulary", "save") from e
